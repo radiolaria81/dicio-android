@@ -447,7 +447,7 @@ class VoskInputDevice(
     }
 
     companion object {
-        private const val SAMPLE_RATE = 44100.0f
+        private const val SAMPLE_RATE = 16000.0f
         private const val ALTERNATIVE_COUNT = 5
         private val TAG = VoskInputDevice::class.simpleName
 
