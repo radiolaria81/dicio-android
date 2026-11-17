@@ -35,6 +35,7 @@ import org.stypox.dicio.R
 import org.stypox.dicio.di.SttInputDeviceWrapper
 import org.stypox.dicio.di.WakeDeviceWrapper
 import org.stypox.dicio.eval.SkillEvaluator
+import org.stypox.dicio.io.input.SttState
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -185,22 +186,38 @@ class WakeService : Service() {
         startForeground(FOREGROUND_NOTIFICATION_ID, notification)
     }
 
-    private fun listenForWakeWord() {
-        @SuppressLint("MissingPermission")
-        val ar = AudioRecord(
+    @SuppressLint("MissingPermission")
+    private fun createAudioRecord(): AudioRecord {
+        return AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             16000,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             6400,
         )
+    }
 
+    private fun listenForWakeWord() {
+        var ar: AudioRecord? = null
         var audio = ShortArray(0)
         var nextWakeWordAllowed = Instant.MIN
 
         try {
-            ar.startRecording()
             while (listening.get()) {
+                if (isSttActive()) {
+                    // The STT is using the microphone (e.g. the user pressed the microphone
+                    // button in the app). Release it, since on some devices only the first
+                    // AudioRecord receives audio, while any other one just gets silence.
+                    ar = releaseAudioRecord(ar)
+                    waitWhileSttActive()
+                    continue
+                }
+
+                if (ar == null) {
+                    ar = createAudioRecord()
+                    ar.startRecording()
+                }
+
                 if (audio.size != wakeDevice.frameSize()) {
                     audio = ShortArray(wakeDevice.frameSize())
                 }
@@ -210,15 +227,54 @@ class WakeService : Service() {
                 val wakeWordDetected = wakeDevice.processFrame(audio)
                 if (wakeWordDetected && Instant.now() > nextWakeWordAllowed) {
                     nextWakeWordAllowed = Instant.now().plusMillis(WAKE_WORD_BACKOFF_MILLIS)
+                    // release the microphone *before* the STT starts listening, see above
+                    ar = releaseAudioRecord(ar)
                     onWakeWordDetected()
+                    // the STT state is propagated asynchronously, so wait for it to become
+                    // active, otherwise the microphone would be reopened right away; the
+                    // check at the top of the loop then waits until the STT has finished
+                    waitForSttToStart()
+                    continue
                 }
 
                 lastHeard.set(Instant.now())
             }
         } finally {
-            ar.stop()
+            releaseAudioRecord(ar)
+        }
+    }
+
+    private fun isSttActive(): Boolean = when (val s = sttInputDevice.uiState.value) {
+        is SttState.Loading -> s.thenStartListening
+        SttState.Listening, SttState.WaitingForResult -> true
+        else -> false
+    }
+
+    private fun waitForSttToStart() {
+        val deadline = Instant.now().plusMillis(STT_START_TIMEOUT_MILLIS)
+        while (listening.get() && !isSttActive() && Instant.now() < deadline) {
+            lastHeard.set(Instant.now()) // the service is still running, just paused
+            Thread.sleep(STT_POLL_MILLIS)
+        }
+    }
+
+    private fun waitWhileSttActive() {
+        while (listening.get() && isSttActive()) {
+            lastHeard.set(Instant.now()) // the service is still running, just paused
+            Thread.sleep(STT_POLL_MILLIS)
+        }
+    }
+
+    private fun releaseAudioRecord(ar: AudioRecord?): AudioRecord? {
+        if (ar != null) {
+            try {
+                ar.stop()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Could not stop wake word AudioRecord", e)
+            }
             ar.release()
         }
+        return null
     }
 
     private fun onWakeWordDetected() {
@@ -364,6 +420,8 @@ class WakeService : Service() {
         private const val START_NOTIFICATION_ID = 48019274
         private const val TRIGGERED_NOTIFICATION_ID = 601398647
         private const val WAKE_WORD_BACKOFF_MILLIS = 4000L
+        private const val STT_START_TIMEOUT_MILLIS = 3000L
+        private const val STT_POLL_MILLIS = 100L
         private const val ACTION_STOP_WAKE_SERVICE =
             "org.stypox.dicio.io.wake.WakeService.ACTION_STOP"
         private const val RELEASE_STT_RESOURCES_MILLIS = 1000L * 60 * 5 // 5 minutes
